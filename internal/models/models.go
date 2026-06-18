@@ -17,17 +17,24 @@ type NodeMetrics struct {
 }
 
 type CenterDetail struct {
-	Region        string  `json:"region"`
-	RegionName    string  `json:"region_name"`
-	HealthScore   float64 `json:"health_score"`
-	Status        string  `json:"status"`
-	CPUUsage      float64 `json:"cpu_usage"`
-	MemoryUsage   float64 `json:"memory_usage"`
-	PacketLoss    float64 `json:"packet_loss"`
-	NetworkBW     float64 `json:"network_bw_mbps"`
-	ActiveTasks   int     `json:"active_transcode_tasks"`
-	NodeCount     int     `json:"node_count"`
-	LastCheckTime string  `json:"last_check_time"`
+	Region         string  `json:"region"`
+	RegionName     string  `json:"region_name"`
+	HealthScore    float64 `json:"health_score"`
+	Status         string  `json:"status"`
+	CPUUsage       float64 `json:"cpu_usage"`
+	MemoryUsage    float64 `json:"memory_usage"`
+	PacketLoss     float64 `json:"packet_loss"`
+	NetworkBW      float64 `json:"network_bw_mbps"`
+	ActiveTasks    int     `json:"active_transcode_tasks"`
+	NodeCount      int     `json:"node_count"`
+	LastCheckTime  string  `json:"last_check_time"`
+	SmoothedCPU    float64 `json:"smoothed_cpu_usage,omitempty"`
+	SmoothedMemory float64 `json:"smoothed_memory_usage,omitempty"`
+	SmoothedLoss   float64 `json:"smoothed_packet_loss,omitempty"`
+	SmoothedTasks  int     `json:"smoothed_transcode_tasks,omitempty"`
+	SmoothedBW     float64 `json:"smoothed_network_bw_mbps,omitempty"`
+	WindowSize     int     `json:"window_size,omitempty"`
+	WindowFilled   int     `json:"window_filled,omitempty"`
 }
 
 type ClusterHealthResponse struct {
