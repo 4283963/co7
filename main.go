@@ -15,6 +15,7 @@ import (
 	"cluster-audit/internal/aggregator"
 	"cluster-audit/internal/checker"
 	"cluster-audit/internal/handler"
+	"cluster-audit/internal/models"
 	"cluster-audit/internal/scheduler"
 )
 
@@ -29,6 +30,11 @@ func main() {
 
 	healthChecker := checker.NewSimulatedChecker()
 	healthAggregator := aggregator.NewHealthAggregator()
+
+	healthAggregator.OnAuditLog(func(entry *models.AuditLogEntry) {
+		log.Printf("[Audit] %s | %s | %s | score=%.2f | %s",
+			entry.Timestamp, entry.EventType, entry.RegionName, entry.Score, entry.Detail)
+	})
 
 	healthScheduler := scheduler.NewHealthCheckScheduler(
 		checkInterval,
@@ -60,16 +66,19 @@ func main() {
 		c.Next()
 	})
 
-	healthHandler := handler.NewHealthHandler(healthScheduler, healthScheduler)
-	handler.RegisterRoutes(app, healthHandler)
+	healthHandler := handler.NewHealthHandler(healthScheduler, healthAggregator, healthScheduler)
+	handler.RegisterRoutes(app, healthHandler, healthAggregator)
 
 	app.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"service": "cluster-audit-api",
-			"version": "1.0.0",
+			"version": "1.1.0",
 			"endpoints": gin.H{
 				"cluster_health":   "GET /api/v1/cluster/health",
 				"region_health":    "GET /api/v1/cluster/health/:region (bj|sh|gz)",
+				"isolate_region":   "POST /api/v1/cluster/isolate",
+				"recover_region":   "POST /api/v1/cluster/recover",
+				"audit_log":        "GET /api/v1/system/audit_log?limit=N",
 				"scheduler_status": "GET /api/v1/system/scheduler",
 			},
 		})

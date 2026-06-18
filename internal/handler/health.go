@@ -2,10 +2,12 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"cluster-audit/internal/aggregator"
 	"cluster-audit/internal/models"
 	"cluster-audit/internal/scheduler"
 )
@@ -14,15 +16,24 @@ type HealthProvider interface {
 	GetLastHealth() *models.ClusterHealth
 }
 
-type HealthHandler struct {
-	healthProvider HealthProvider
-	scheduler      *scheduler.HealthCheckScheduler
+type IsolationManager interface {
+	IsolateRegion(region, reason string) (*models.IsolateData, error)
+	RecoverRegion(region string) (*models.IsolateData, error)
+	IsRegionIsolated(region string) bool
+	GetAuditLog(limit int) []*models.AuditLogEntry
 }
 
-func NewHealthHandler(hp HealthProvider, s *scheduler.HealthCheckScheduler) *HealthHandler {
+type HealthHandler struct {
+	healthProvider   HealthProvider
+	isolationManager IsolationManager
+	scheduler        *scheduler.HealthCheckScheduler
+}
+
+func NewHealthHandler(hp HealthProvider, im IsolationManager, s *scheduler.HealthCheckScheduler) *HealthHandler {
 	return &HealthHandler{
-		healthProvider: hp,
-		scheduler:      s,
+		healthProvider:   hp,
+		isolationManager: im,
+		scheduler:        s,
 	}
 }
 
@@ -70,6 +81,8 @@ func (h *HealthHandler) GetCenterHealth(c *gin.Context) {
 				GeneratedAt:   health.GeneratedAt,
 				TotalNodes:    center.NodeCount,
 				TotalTasks:    center.ActiveTasks,
+				IsolatedCount: boolToInt(center.Isolated),
+				ActiveCount:   1 - boolToInt(center.Isolated),
 				Centers:       []*models.CenterDetail{center},
 			}
 			c.JSON(http.StatusOK, &models.ClusterHealthResponse{
@@ -85,6 +98,98 @@ func (h *HealthHandler) GetCenterHealth(c *gin.Context) {
 		Code:    40401,
 		Message: "region not found: " + region,
 		Data:    nil,
+	})
+}
+
+func (h *HealthHandler) IsolateRegion(c *gin.Context) {
+	var req models.IsolateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, &models.IsolateResponse{
+			Code:    40001,
+			Message: "invalid request: " + err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+
+	if _, ok := models.RegionNameMap[req.Region]; !ok {
+		c.JSON(http.StatusBadRequest, &models.IsolateResponse{
+			Code:    40002,
+			Message: "unknown region: " + req.Region + ", valid: bj, sh, gz",
+			Data:    nil,
+		})
+		return
+	}
+
+	data, err := h.isolationManager.IsolateRegion(req.Region, req.Reason)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, &models.IsolateResponse{
+			Code:    50001,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, &models.IsolateResponse{
+		Code:    0,
+		Message: "region isolated successfully",
+		Data:    data,
+	})
+}
+
+func (h *HealthHandler) RecoverRegion(c *gin.Context) {
+	var req models.IsolateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, &models.IsolateResponse{
+			Code:    40001,
+			Message: "invalid request: " + err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+
+	if _, ok := models.RegionNameMap[req.Region]; !ok {
+		c.JSON(http.StatusBadRequest, &models.IsolateResponse{
+			Code:    40002,
+			Message: "unknown region: " + req.Region + ", valid: bj, sh, gz",
+			Data:    nil,
+		})
+		return
+	}
+
+	data, err := h.isolationManager.RecoverRegion(req.Region)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, &models.IsolateResponse{
+			Code:    50001,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, &models.IsolateResponse{
+		Code:    0,
+		Message: "region recovered successfully",
+		Data:    data,
+	})
+}
+
+func (h *HealthHandler) GetAuditLog(c *gin.Context) {
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit < 1 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	logs := h.isolationManager.GetAuditLog(limit)
+	c.JSON(http.StatusOK, &models.AuditLogResponse{
+		Code:    0,
+		Message: "success",
+		Data:    logs,
 	})
 }
 
@@ -134,17 +239,27 @@ func (h *HealthHandler) GetSchedulerStatus(c *gin.Context) {
 	})
 }
 
-func RegisterRoutes(r *gin.Engine, healthHandler *HealthHandler) {
+func RegisterRoutes(r *gin.Engine, healthHandler *HealthHandler, agg *aggregator.HealthAggregator) {
 	apiV1 := r.Group("/api/v1")
 	{
 		cluster := apiV1.Group("/cluster")
 		{
 			cluster.GET("/health", healthHandler.GetClusterHealth)
 			cluster.GET("/health/:region", healthHandler.GetCenterHealth)
+			cluster.POST("/isolate", healthHandler.IsolateRegion)
+			cluster.POST("/recover", healthHandler.RecoverRegion)
 		}
 		system := apiV1.Group("/system")
 		{
 			system.GET("/scheduler", healthHandler.GetSchedulerStatus)
+			system.GET("/audit_log", healthHandler.GetAuditLog)
 		}
 	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

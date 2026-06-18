@@ -1,6 +1,7 @@
 package aggregator
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -25,8 +26,11 @@ var defaultWeights = ScoringWeights{
 }
 
 const (
-	DefaultWindowSize = 5
-	EWMAAlpha         = 0.45
+	DefaultWindowSize   = 5
+	EWMAAlpha           = 0.45
+	LowScoreThreshold   = 40.0
+	ConsecutiveLowLimit = 3
+	MaxAuditLogEntries  = 200
 )
 
 type regionRawSample struct {
@@ -114,12 +118,23 @@ type regionSnapshot struct {
 	latestTime time.Time
 }
 
+type isolationRecord struct {
+	isolated   bool
+	isolatedAt string
+	reason     string
+}
+
 type HealthAggregator struct {
 	weights     ScoringWeights
 	windowSize  int
 	mu          sync.RWMutex
 	windows     map[string]*slidingWindow
 	lastDetails map[string]*models.CenterDetail
+
+	isolationMap    map[string]*isolationRecord
+	lowScoreCounter map[string]int
+	auditLog        []*models.AuditLogEntry
+	onAuditLog      func(entry *models.AuditLogEntry)
 }
 
 func NewHealthAggregator() *HealthAggregator {
@@ -131,11 +146,156 @@ func NewHealthAggregatorWithWindow(windowSize int) *HealthAggregator {
 		windowSize = 2
 	}
 	return &HealthAggregator{
-		weights:     defaultWeights,
-		windowSize:  windowSize,
-		windows:     make(map[string]*slidingWindow),
-		lastDetails: make(map[string]*models.CenterDetail),
+		weights:         defaultWeights,
+		windowSize:      windowSize,
+		windows:         make(map[string]*slidingWindow),
+		lastDetails:     make(map[string]*models.CenterDetail),
+		isolationMap:    make(map[string]*isolationRecord),
+		lowScoreCounter: make(map[string]int),
+		auditLog:        make([]*models.AuditLogEntry, 0, MaxAuditLogEntries),
 	}
+}
+
+func (a *HealthAggregator) OnAuditLog(fn func(entry *models.AuditLogEntry)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.onAuditLog = fn
+}
+
+func (a *HealthAggregator) addAuditLog(entry *models.AuditLogEntry) {
+	if len(a.auditLog) >= MaxAuditLogEntries {
+		a.auditLog = a.auditLog[1:]
+	}
+	a.auditLog = append(a.auditLog, entry)
+	if a.onAuditLog != nil {
+		a.onAuditLog(entry)
+	}
+}
+
+func (a *HealthAggregator) IsolateRegion(region, reason string) (*models.IsolateData, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, ok := models.RegionNameMap[region]; !ok {
+		return nil, fmt.Errorf("unknown region: %s", region)
+	}
+
+	rec, ok := a.isolationMap[region]
+	if !ok {
+		rec = &isolationRecord{}
+		a.isolationMap[region] = rec
+	}
+
+	if rec.isolated {
+		return &models.IsolateData{
+			Region:      region,
+			RegionName:  models.RegionNameMap[region],
+			Isolated:    true,
+			IsolatedAt:  rec.isolatedAt,
+			Reason:      rec.reason,
+			HealthScore: a.getLastScore(region),
+		}, nil
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	rec.isolated = true
+	rec.isolatedAt = now
+	rec.reason = reason
+
+	a.addAuditLog(&models.AuditLogEntry{
+		Timestamp:  now,
+		Region:     region,
+		RegionName: models.RegionNameMap[region],
+		EventType:  "isolated",
+		Score:      a.getLastScore(region),
+		Detail:     fmt.Sprintf("region %s isolated manually, reason: %s", region, reason),
+	})
+
+	return &models.IsolateData{
+		Region:      region,
+		RegionName:  models.RegionNameMap[region],
+		Isolated:    true,
+		IsolatedAt:  now,
+		Reason:      reason,
+		HealthScore: a.getLastScore(region),
+	}, nil
+}
+
+func (a *HealthAggregator) RecoverRegion(region string) (*models.IsolateData, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, ok := models.RegionNameMap[region]; !ok {
+		return nil, fmt.Errorf("unknown region: %s", region)
+	}
+
+	rec, ok := a.isolationMap[region]
+	if !ok || !rec.isolated {
+		return &models.IsolateData{
+			Region:      region,
+			RegionName:  models.RegionNameMap[region],
+			Isolated:    false,
+			HealthScore: a.getLastScore(region),
+		}, nil
+	}
+
+	rec.isolated = false
+	oldAt := rec.isolatedAt
+	rec.isolatedAt = ""
+	rec.reason = ""
+	a.lowScoreCounter[region] = 0
+
+	a.addAuditLog(&models.AuditLogEntry{
+		Timestamp:  time.Now().Format(time.RFC3339),
+		Region:     region,
+		RegionName: models.RegionNameMap[region],
+		EventType:  "recovered",
+		Score:      a.getLastScore(region),
+		Detail:     fmt.Sprintf("region %s recovered from isolation (was isolated at %s)", region, oldAt),
+	})
+
+	return &models.IsolateData{
+		Region:      region,
+		RegionName:  models.RegionNameMap[region],
+		Isolated:    false,
+		HealthScore: a.getLastScore(region),
+	}, nil
+}
+
+func (a *HealthAggregator) GetIsolationStatus() map[string]*isolationRecord {
+	result := make(map[string]*isolationRecord)
+	for k, v := range a.isolationMap {
+		result[k] = v
+	}
+	return result
+}
+
+func (a *HealthAggregator) GetAuditLog(limit int) []*models.AuditLogEntry {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	total := len(a.auditLog)
+	start := 0
+	if limit > 0 && limit < total {
+		start = total - limit
+	}
+	result := make([]*models.AuditLogEntry, total-start)
+	copy(result, a.auditLog[start:])
+	return result
+}
+
+func (a *HealthAggregator) IsRegionIsolated(region string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	rec, ok := a.isolationMap[region]
+	return ok && rec.isolated
+}
+
+func (a *HealthAggregator) getLastScore(region string) float64 {
+	if d, ok := a.lastDetails[region]; ok {
+		return d.HealthScore
+	}
+	return 0
 }
 
 func (a *HealthAggregator) Aggregate(metrics []*models.NodeMetrics) *models.ClusterHealth {
@@ -162,6 +322,8 @@ func (a *HealthAggregator) Aggregate(metrics []*models.NodeMetrics) *models.Clus
 	totalNodes := 0
 	totalTasks := 0
 	totalScore := 0.0
+	activeCount := 0
+	isolatedCount := 0
 
 	for _, region := range regions {
 		nodes, exists := regionMap[region]
@@ -172,16 +334,33 @@ func (a *HealthAggregator) Aggregate(metrics []*models.NodeMetrics) *models.Clus
 		snap := a.sampleAndSmooth(region, nodes)
 		detail := a.calculateCenterDetail(region, nodes, snap)
 
+		isolated := a.isolationMap[region] != nil && a.isolationMap[region].isolated
+		detail.Isolated = isolated
+		if isolated {
+			detail.IsolatedAt = a.isolationMap[region].isolatedAt
+			detail.Status = "isolated"
+			isolatedCount++
+		} else {
+			activeCount++
+		}
+
+		a.trackLowScore(region, detail.HealthScore)
+
+		detail.LowScoreConsecutive = a.lowScoreCounter[region]
+
 		a.lastDetails[region] = detail
 		centers = append(centers, detail)
 		totalNodes += detail.NodeCount
 		totalTasks += detail.ActiveTasks
-		totalScore += detail.HealthScore
+
+		if !isolated {
+			totalScore += detail.HealthScore
+		}
 	}
 
 	overallScore := 0.0
-	if len(centers) > 0 {
-		overallScore = round(totalScore/float64(len(centers)), 2)
+	if activeCount > 0 {
+		overallScore = round(totalScore/float64(activeCount), 2)
 	}
 
 	sort.Slice(centers, func(i, j int) bool {
@@ -194,7 +373,40 @@ func (a *HealthAggregator) Aggregate(metrics []*models.NodeMetrics) *models.Clus
 		GeneratedAt:   time.Now().Format(time.RFC3339),
 		TotalNodes:    totalNodes,
 		TotalTasks:    totalTasks,
+		IsolatedCount: isolatedCount,
+		ActiveCount:   activeCount,
 		Centers:       centers,
+	}
+}
+
+func (a *HealthAggregator) trackLowScore(region string, score float64) {
+	if score < LowScoreThreshold {
+		a.lowScoreCounter[region]++
+	} else {
+		a.lowScoreCounter[region] = 0
+	}
+
+	count := a.lowScoreCounter[region]
+	if count == ConsecutiveLowLimit {
+		a.addAuditLog(&models.AuditLogEntry{
+			Timestamp:  time.Now().Format(time.RFC3339),
+			Region:     region,
+			RegionName: models.RegionNameMap[region],
+			EventType:  "low_score_alert",
+			Score:      score,
+			Detail:     fmt.Sprintf("region %s score %.2f < %.0f for %d consecutive checks, recommend isolation", region, score, LowScoreThreshold, ConsecutiveLowLimit),
+		})
+	}
+
+	if count > ConsecutiveLowLimit && count%ConsecutiveLowLimit == 0 {
+		a.addAuditLog(&models.AuditLogEntry{
+			Timestamp:  time.Now().Format(time.RFC3339),
+			Region:     region,
+			RegionName: models.RegionNameMap[region],
+			EventType:  "low_score_persistent",
+			Score:      score,
+			Detail:     fmt.Sprintf("region %s score %.2f still below threshold for %d consecutive checks", region, score, count),
+		})
 	}
 }
 
